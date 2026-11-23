@@ -1,197 +1,96 @@
-// The story: five missions for Mara, the fixer at The Flamingo bar, taking the
-// player from a new arrival in Neon Palms to the big score at Sunset Bank.
-// A mission is a list of stages; each stage has an objective line, a target
-// (a place, a car, or a count) and a check the game runs every step.
-import { MONEY } from './config.js';
-import { createThugs } from './entities.js';
+// Neon Palms — Mara's five-mission story chain.
+import { MISSION_REWARDS } from './config.js';
+import { landmarkById } from './world.js';
+import { dist, clamp } from './random.js';
 
-export const MISSION_COUNT = 5;
-
-/**
- * Mission definitions. `target` is resolved against the city at start:
- *   { place: 'bar' }          a landmark door spot
- *   { place: 'bank', radius } a landmark with an arrival radius
- *   { anyCar: true }          any car the player drives
- *   { thugs: 3 }              thugs spawned at a place
- */
-export const MISSIONS = [
-  {
-    id: 1,
-    title: 'Fresh Off the Bus',
-    briefing: "Mara: 'New face. You want work, you walk to The Flamingo and ask for me. Don't keep me waiting.'",
-    stages: [
-      { text: 'Walk to The Flamingo bar and talk to Mara (E)', target: { place: 'bar', radius: 46, interact: true } },
-    ],
-  },
-  {
-    id: 2,
-    title: 'Borrowed Wheels',
-    briefing: "Mara: 'A client needs a ride across town. Borrow a car — any car — and bring it to the Palm Court Hotel.'",
-    stages: [
-      { text: 'Steal a car (walk up to one and press E)', target: { anyCar: true } },
-      { text: 'Drive the car to the Palm Court Hotel', target: { place: 'hotel', radius: 90, inCar: true } },
-    ],
-  },
-  {
-    id: 3,
-    title: 'The Pickup',
-    briefing: "Mara: 'A package is waiting at Warehouse 9. Pick it up on foot, then drive it back to the bar. Quietly.'",
-    stages: [
-      { text: 'Drive to Warehouse 9', target: { place: 'warehouse', radius: 110, inCar: true } },
-      { text: 'Get out and collect the package (E)', target: { place: 'warehouse', radius: 60, onFoot: true, interact: true } },
-      { text: 'Deliver the package to The Flamingo', target: { place: 'bar', radius: 90 } },
-    ],
-  },
-  {
-    id: 4,
-    title: 'Loud Neighbours',
-    briefing: "Mara: 'A crew from the docks is shaking down my bar. Go to the pier, teach them manners, and don't get caught.'",
-    stages: [
-      { text: 'Go to Neon Pier', target: { place: 'pier', radius: 130 } },
-      { text: 'Deal with the dock crew (3)', target: { thugs: 3, place: 'pier' } },
-      { text: 'Lose the heat and get back to the bar', target: { place: 'bar', radius: 90, quiet: true } },
-    ],
-  },
-  {
-    id: 5,
-    title: 'The Big Score',
-    briefing: "Mara: 'Sunset Bank. One guard, one vault, one clean getaway. Take the cash to the safehouse and we're rich.'",
-    stages: [
-      { text: 'Drive to Sunset Bank', target: { place: 'bank', radius: 110, inCar: true } },
-      { text: 'Get out and grab the cash (E)', target: { place: 'bank', radius: 60, onFoot: true, interact: true } },
-      { text: 'Escape to the Coral Court safehouse', target: { place: 'safehouse', radius: 100 } },
-    ],
-  },
+export const MISSION_DEFS = [
+  { id: 'm1', title: 'Meet Mara', target: 'bar',
+    text: "Mara runs the bar on Palm Row. She has work for you. Go see her.",
+    hint: 'Drive or walk to the pink beacon at the bar.' },
+  { id: 'm2', title: 'Borrowed Wheels', target: 'hotel',
+    text: "Mara needs a clean car. Steal any traffic car (E) and deliver it to the Palms Hotel.",
+    hint: 'Press E near a car to take it, then drive to the hotel beacon.' },
+  { id: 'm3', title: 'The Pickup', target: 'warehouse',
+    text: "Pick up Mara's goods at the Dock Warehouse. No questions, no peeking.",
+    hint: 'Reach the warehouse beacon to collect the goods.' },
+  { id: 'm4', title: 'Dock Trouble', target: 'docks',
+    text: "A rival crew is holding the docks. Clear them out — punch (F) or shoot (click).",
+    hint: 'Defeat every gang member at the docks.' },
+  { id: 'm5', title: 'The Neon Bank', target: 'bank',
+    text: "The big one: rob the Neon Bank, then lose the heat. Grab the cash at the bank and get clear.",
+    hint: 'Reach the bank, grab the cash, then survive with no police on your tail.' },
 ];
 
-export function createMissions() {
-  return {
-    index: 0, // 0-based mission; MISSION_COUNT means the story is done
-    stage: 0,
-    done: false,
-    banner: null, // { text, timer } shown after a stage or mission completes
-    interactReady: false, // an E prompt is showing for the current stage
-    thugsSpawned: false,
-    completedCount: 0,
-  };
+export function makeMissionState() {
+  return { index: 0, stage: 'go', deliveredCar: null, gangLeft: 0, bankTimer: 0, done: false };
 }
 
-export function currentMission(missions) {
-  return missions.index < MISSION_COUNT ? MISSIONS[missions.index] : null;
+export function currentMission() { return MISSION_DEFS; }
+export function missionTarget(game) {
+  const def = MISSION_DEFS[game.missions.index];
+  if (!def) return null;
+  return landmarkById(game.world, def.target);
+}
+export function missionText(game) {
+  const def = MISSION_DEFS[game.missions.index];
+  if (!def) return 'Story complete. Neon Palms is yours.';
+  return def.title + ' — ' + def.text;
 }
 
-export function currentStage(missions) {
-  const mission = currentMission(missions);
-  return mission ? mission.stages[missions.stage] : null;
-}
-
-export function objectiveText(missions) {
-  const mission = currentMission(missions);
-  if (!mission) return 'Story complete — Neon Palms is yours. Free roam.';
-  const stage = mission.stages[missions.stage];
-  return `${mission.id}. ${mission.title} — ${stage.text}`;
-}
-
-/** Where the current stage points, in world coordinates, or null. */
-export function stageTarget(missions, city) {
-  const stage = currentStage(missions);
-  if (!stage || !stage.target) return null;
-  if (stage.target.place) {
-    const place = city.landmarks[stage.target.place];
-    return place ? { x: place.x, y: place.y, radius: stage.target.radius ?? 80 } : null;
+export function completeMission(game) {
+  const idx = game.missions.index;
+  const reward = MISSION_REWARDS[idx] || 500;
+  game.player.money += reward;
+  game.player.cash = game.player.money;
+  game.sound.missionDone();
+  game.floaters.push({ x: game.player.x, y: game.player.y - 30, text: '+$' + reward, life: 2, color: '#a6ff3d' });
+  game.missions.index += 1;
+  game.missions.stage = 'go';
+  game.missions.gangLeft = 0;
+  if (game.missions.index >= MISSION_DEFS.length) {
+    game.missions.done = true;
+    game.screen = 'complete';
+    game.bestCash = Math.max(game.bestCash || 0, game.player.money);
   }
-  return null;
+  game.saveNow();
 }
 
-/** Advance one stage; on the last stage, finish the mission and pay out. */
-export function advanceStage(missions, game) {
-  const mission = currentMission(missions);
-  if (!mission) return;
-  missions.stage += 1;
-  if (missions.stage >= mission.stages.length) {
-    const reward = MONEY.missionReward[missions.index] ?? 500;
-    game.money += reward;
-    missions.completedCount += 1;
-    missions.index += 1;
-    missions.stage = 0;
-    missions.thugsSpawned = false;
-    if (missions.index >= MISSION_COUNT) {
-      missions.done = true;
-      missions.banner = { text: `STORY COMPLETE — The Big Score paid $${reward}. Neon Palms is yours.`, timer: 6 };
-    } else {
-      const next = MISSIONS[missions.index];
-      missions.banner = { text: `Mission complete: ${mission.title}  +$${reward} — Next: ${next.title}`, timer: 5 };
+export function updateMissions(game, dt) {
+  if (game.missions.done || game.screen !== 'play') return;
+  const def = MISSION_DEFS[game.missions.index];
+  const tgt = missionTarget(game);
+  if (!tgt) return;
+  const p = game.player;
+  const d = dist(p.x, p.y, tgt.x, tgt.y);
+  if (def.id === 'm1' && d < 95) { completeMission(game); return; }
+  if (def.id === 'm2') {
+    if (p.inCar && p.inCar.stolen && d < 100) {
+      game.missions.deliveredCar = p.inCar;
+      completeMission(game);
     }
-    game.events.push('mission-complete');
-  } else {
-    missions.banner = { text: 'Objective updated', timer: 2.5 };
+    return;
   }
-}
-
-/**
- * Check the current stage against the game. Returns true when the stage just
- * advanced. `interact` is true the step the player pressed E.
- */
-export function updateMissions(missions, game, interact) {
-  const stage = currentStage(missions);
-  if (!stage) return false;
-  const target = stage.target;
-  const player = game.player;
-  missions.interactReady = false;
-
-  if (target.place) {
-    const place = game.city.landmarks[target.place];
-    if (!place) return false;
-    const dist = Math.hypot(player.x - place.x, player.y - place.y);
-    if (target.interact) {
-      if (dist < target.radius && !player.inCar) {
-        missions.interactReady = true;
-        if (interact) {
-          advanceStage(missions, game);
-          return true;
-        }
-      }
-      return false;
+  if (def.id === 'm3' && d < 95) { completeMission(game); return; }
+  if (def.id === 'm4') {
+    if (game.missions.gangLeft === 0 && !game.missions.spawnedGang) {
+      game.spawnGang(tgt.x, tgt.y);
+      game.missions.spawnedGang = true;
     }
-    if (target.inCar && !player.inCar) return false;
-    if (target.onFoot && player.inCar) return false;
-    if (target.quiet && game.police.stars > 0.5) return false;
-    if (dist < target.radius) {
-      advanceStage(missions, game);
-      return true;
+    if (game.missions.spawnedGang && game.missions.gangLeft <= 0) {
+      game.missions.spawnedGang = false;
+      completeMission(game);
     }
-    return false;
+    return;
   }
-  if (target.anyCar) {
-    if (player.inCar) {
-      advanceStage(missions, game);
-      return true;
+  if (def.id === 'm5') {
+    if (game.missions.stage === 'go' && d < 95) {
+      game.missions.stage = 'escape';
+      game.player.money += 1500;
+      game.floaters.push({ x: p.x, y: p.y - 30, text: '+$1500 bank cash', life: 2, color: '#ffb02e' });
+      game.addWanted(3, 'bank robbery');
+    } else if (game.missions.stage === 'escape') {
+      game.missions.bankTimer += dt;
+      if (game.wanted === 0 && game.missions.bankTimer > 3) completeMission(game);
     }
-    return false;
-  }
-  if (target.thugs) {
-    const alive = game.thugs.filter((t) => !t.dead).length;
-    if (alive === 0) {
-      advanceStage(missions, game);
-      return true;
-    }
-    return false;
-  }
-  return false;
-}
-
-/** Spawn the dock crew for mission 4 when the player reaches the pier. */
-export function maybeSpawnThugs(missions, game) {
-  const stage = currentStage(missions);
-  if (!stage || !stage.target || stage.target.thugs !== 3 || missions.thugsSpawned) return;
-  const pier = game.city.landmarks.pier;
-  const dist = Math.hypot(game.player.x - pier.x, game.player.y - pier.y);
-  if (dist < 260) {
-    missions.thugsSpawned = true;
-    game.thugs = createThugs(game.random, [
-      { x: pier.x - 70, y: pier.y - 40 },
-      { x: pier.x + 60, y: pier.y - 70 },
-      { x: pier.x + 10, y: pier.y + 70 },
-    ]);
   }
 }

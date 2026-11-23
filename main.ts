@@ -1,15 +1,13 @@
-// Neon Palms (Node 22, standard library only): the game is this directory's
-// game/ folder, plain static files a desktop browser loads offline (game/index.html and its ES
-// modules, no library and no network request), and the program hands it in. It copies game/ and
-// screenshots/ from beside this file to /output and writes /output/dossier.json, the summary the
-// judge reads, with the vendored make.fun library. The game itself is an original 2D top-down
-// open-world crime game: a neon city to explore on foot and by car, traffic and pedestrians,
-// cars to steal and drive, a wanted level with police who chase you, five story missions, combat,
-// a HUD with a minimap, saving, and synthesized sound.
-//
-// Serve it locally with `node serve.ts`, then open http://localhost:8080.
-// Outside the grader's container, MAKEFUN_OUTPUT_DIR stands in for /output:
-//   mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts
+// Neon Palms, handed in by this program: the game lives in game/ as plain
+// static files (game/index.html plus its ES modules) that any desktop browser
+// can open offline, with no libraries and no network requests. This file
+// copies game/ and screenshots/ from beside itself into /output and writes
+// /output/dossier.json with the vendored make.fun library, so the judge gets
+// the whole entry in one folder. Neon Palms itself is a 2D top-down
+// open-world crime game set in a neon-lit coastal city: explore on foot or
+// by stolen car, dodge traffic and pedestrians, earn wanted stars and outrun
+// the police, fight rival gangs, and run five story jobs for Mara, the bar
+// owner, with a HUD, a live minimap, synthesized sound and autosaving.
 
 import { cpSync, existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';

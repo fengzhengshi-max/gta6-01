@@ -1,498 +1,317 @@
-// Boot and the one loop: input is read every frame, the world advances in fixed
-// 1/60 s steps, and the renderer paints what is there. Screens: title, play,
-// paused, wasted, busted and story-complete. ?seed=N fixes the city; ?shot=
-// cover|chase|mission|onfoot (with &seed=N) stages that scene instead of
-// running the loop, paints it twice and sets window.__shotReady.
-import { CAR, HEAT, MONEY, STEP, TRAFFIC } from './config.js';
-import { createRandom } from './random.js';
-import { createCity, spawnPoint } from './world.js';
-import {
-  createBullets, createPedestrians, createTraffic, spawnTrafficCar, updateBullets,
-  updatePedestrians, updateThugs, updateTraffic,
-} from './entities.js';
-import {
-  createPlayer, createPlayerCar, enterCar, exitCar, healPlayer, hurtPlayer,
-  nearestEnterableCar, playerPunch, playerReload, playerShoot, updateDriving,
-  updateOnFoot,
-} from './player.js';
-import { addHeat, applyBust, createPolice, updatePolice, wantedStars } from './police.js';
-import {
-  createMissions, currentMission, maybeSpawnThugs, updateMissions,
-} from './missions.js';
-import { ACTION_CONFIRM, ACTION_INTERACT, ACTION_PAUSE, ACTION_PUNCH, ACTION_RELOAD, createInput } from './input.js';
-import { createAudio } from './audio.js';
-import { applySave, clearSave, readBestCash, readSave, writeBestCash, writeSave } from './save.js';
-import { createRenderer, SCREEN_BUSTED, SCREEN_OVER, SCREEN_PAUSED, SCREEN_PLAY, SCREEN_TITLE, SCREEN_WIN } from './render.js';
+// Neon Palms — game orchestration: state, loop, combat, crime, camera.
+import { CFG } from './config.js';
+import { makeRng, pick, range, clamp, dist, angleTo, angleDiff } from './random.js';
+import { buildWorld, landmarkById, hitsBuilding } from './world.js';
+import { spawnTraffic, spawnPedestrians, updateTrafficCar, updatePed, makeBullet, updateBullets, makeCar } from './entities.js';
+import { makePlayer, updateOnFoot, updateDriving, nearestCar, enterCar, exitCar } from './player.js';
+import { addWanted, updateWanted, spawnPolice, updatePolice } from './police.js';
+import { makeMissionState, updateMissions } from './missions.js';
+import { drawWorld, drawEntities, drawHUD, drawMinimap, drawScreen } from './render.js';
+import { Input } from './input.js';
+import { SoundBank } from './audio.js';
+import { saveGame, loadGame, hasSave, bestCash } from './save.js';
 import { stageShot } from './shots.js';
 
-const MAX_FRAME = 0.25;
-const AUTOSAVE_SECONDS = 20;
-
-const params = new URLSearchParams(window.location.search);
-const shot = params.get('shot');
-const seedParam = Number.parseInt(params.get('seed') ?? '', 10);
-const seed = Number.isInteger(seedParam) ? seedParam : Math.floor(Math.random() * 4294967296);
-
-/** Build a fresh game from a seed. */
-export function createGame(gameSeed) {
-  const random = createRandom(gameSeed);
-  const city = createCity(random);
-  const spawn = spawnPoint(city);
-  const player = createPlayer(spawn);
-  const playerCar = createPlayerCar(city);
-  return {
-    seed: gameSeed,
-    random, city, player, playerCar,
-    traffic: createTraffic(random),
-    peds: createPedestrians(random, city),
-    police: createPolice(),
-    bullets: createBullets(),
-    thugs: [],
-    missions: createMissions(),
-    money: MONEY.start,
-    time: 0,
-    events: [],
-    scare: null,
-    nearCar: null,
-    autosaveTimer: AUTOSAVE_SECONDS,
-    winShown: false,
-  };
-}
-
-/** All the cars the player could drive or shoot, for bullet targets. */
-function carTargets(game) {
-  const list = game.traffic.slice();
-  list.push(...game.police.cars);
-  if (game.playerCar && !list.includes(game.playerCar)) list.push(game.playerCar);
-  if (game.player.inCar && !list.includes(game.player.inCar)) list.push(game.player.inCar);
-  return list;
-}
-
-/** Apply a combat hit: a pedestrian or thug hurt, a car damaged. */
-function applyHit(game, hit, hooks) {
-  const target = hit.target;
-  if (hit.kind === 'ped') {
-    if (target.dead) return;
-    target.dead = true;
-    target.downTimer = 30;
-    game.scare = { x: target.x, y: target.y };
-    if (hit.from === 'player') {
-      addHeat(game.police, HEAT.killPed);
-      hooks.sound('punch');
+export class Game {
+  constructor(canvas) {
+    this.canvas = canvas;
+    this.ctx = canvas.getContext('2d');
+    this.rng = makeRng(CFG.seed);
+    this.world = buildWorld(CFG.seed);
+    this.sound = new SoundBank();
+    this.input = new Input(canvas);
+    this.screen = 'title';
+    this.time = 0; this.camX = 0; this.camY = 0;
+    this.wanted = 0; this.quietTimer = 0; this.bustedTimer = 0;
+    this.bullets = []; this.floaters = []; this.gang = [];
+    this.autosaveTimer = 0; this.sirenTimer = 0;
+    this.bestCash = bestCash();
+    this.saveData = loadGame();
+    this.hasSave = hasSave();
+    this.resetWorld();
+    this.last = performance.now();
+    requestAnimationFrame((t) => this.loop(t));
+  }
+  resetWorld() {
+    const safe = landmarkById(this.world, 'safehouse');
+    this.player = makePlayer(this.world.roadsX[2] + 52, safe.y + 90);
+    this.cars = spawnTraffic(this.world, this.rng, CFG.trafficCars, this.player);
+    this.peds = spawnPedestrians(this.world, this.rng, CFG.pedestrians, this.player);
+    // A few parked cars on the road beside the safehouse so the player can drive early.
+    const roadX = this.world.roadsX[2];
+    for (let i = 0; i < 3; i++) {
+      const c = makeCar('park' + i, roadX, safe.y + 110 + i * 64, Math.PI / 2, pick(this.rng, ['#e8452c', '#2c7de8', '#e8c832']));
+      this.cars.push(c);
     }
-  } else if (hit.kind === 'thug') {
-    target.health -= hit.damage;
-    if (target.health <= 0) {
-      target.dead = true;
-      if (hit.from === 'player') addHeat(game.police, HEAT.killPed);
+    this.police = [];
+    this.missions = makeMissionState();
+    this.wanted = 0; this.bustedTimer = 0;
+  }
+  newGame() {
+    this.resetWorld();
+    this.screen = 'play';
+    this.sound.ensure();
+  }
+  continueGame() {
+    const s = this.saveData;
+    this.resetWorld();
+    if (s) {
+      this.player.money = s.money || 0; this.player.cash = this.player.money;
+      this.player.health = s.health || 100;
+      this.player.x = s.x || this.player.x; this.player.y = s.y || this.player.y;
+      this.missions.index = Math.min(s.missionIndex || 0, 4);
+      this.wanted = 0;
     }
-  } else if (hit.kind === 'car') {
-    target.health -= hit.damage;
-    if (target.health <= 0 && !target.wrecked) {
-      target.wrecked = true;
-      target.health = 0;
-      if (target.kind === 'police') {
-        target.dead = true;
-        game.police.cars = game.police.cars.filter((c) => c !== target);
+    this.screen = 'play';
+    this.sound.ensure();
+  }
+  addWanted(n, reason) { addWanted(this, n, reason); }
+  saveNow() { this.bestCash = Math.max(this.bestCash, this.player.money); saveGame(this); }
+  onCrash(speed) {
+    if (speed < 60) return;
+    this.sound.crash();
+    if (this.player.inCar) this.player.inCar.health -= speed * 0.05;
+    if (this.player.inCar && this.player.inCar.health <= 0) this.onCarWrecked();
+  }
+  onCarWrecked() {
+    const car = this.player.inCar;
+    if (car) { car.dead = true; this.cars = this.cars.filter((c) => c !== car); }
+    this.player.inCar = null;
+    this.player.health -= 25;
+    this.sound.crash();
+    if (this.player.health <= 0) this.onWasted();
+  }
+  onWasted() {
+    this.player.health = 100;
+    this.player.money = Math.max(0, this.player.money - 200);
+    const safe = landmarkById(this.world, 'safehouse');
+    this.player.x = safe.x; this.player.y = safe.y; this.player.inCar = null;
+    this.wanted = 0; this.police.forEach((c) => { c.dead = true; });
+    this.police = []; this.cars = this.cars.filter((c) => !c.police);
+    this.screen = 'wasted';
+    this.saveNow();
+  }
+  onBusted() {
+    this.player.money = Math.max(0, this.player.money - 300);
+    const st = landmarkById(this.world, 'station');
+    this.player.x = st.x; this.player.y = st.y; this.player.inCar = null;
+    this.wanted = 0; this.bustedTimer = 0;
+    this.police.forEach((c) => { c.dead = true; });
+    this.police = []; this.cars = this.cars.filter((c) => !c.police);
+    this.sound.busted();
+    this.screen = 'busted';
+    this.saveNow();
+  }
+  spawnGang(x, y) {
+    this.gang = [];
+    for (let i = 0; i < 5; i++) {
+      this.gang.push({ id: 'g' + i, x: x + range(this.rng, -90, 90), y: y + range(this.rng, -90, 90),
+        angle: 0, speed: 60, shirt: '#8a1a1a', health: 70, dead: false, shootTimer: range(this.rng, 1, 2.5), walkPhase: 0 });
+    }
+    this.missions.gangLeft = 5;
+  }
+  tryPunch() {
+    const p = this.player;
+    if (p.punchCooldown > 0 || p.inCar) return;
+    p.punchCooldown = 0.45;
+    this.sound.punch();
+    const hit = (t, r) => {
+      if (t.dead) return false;
+      const d = dist(p.x, p.y, t.x, t.y);
+      if (d > CFG.punchRange + r) return false;
+      if (Math.abs(angleDiff(p.aimAngle, angleTo(p.x, p.y, t.x, t.y))) > CFG.punchArc) return false;
+      return true;
+    };
+    for (const g of this.gang) if (hit(g, 10)) this.damageGang(g, CFG.punchDamage);
+    for (const ped of this.peds) {
+      if (hit(ped, 10)) {
+        ped.dead = true;
+        this.addWanted(1, 'assault');
+        this.floaters.push({ x: ped.x, y: ped.y - 20, text: 'ASSAULT +1★', life: 1.5, color: '#ff2e44' });
       }
     }
-  } else if (hit.kind === 'player') {
-    if (hurtPlayer(game.player, hit.damage)) {
-      hooks.sound('hurt');
-      game.events.push('wasted');
+  }
+  damageGang(g, dmg) {
+    g.health -= dmg;
+    if (g.health <= 0 && !g.dead) {
+      g.dead = true; this.missions.gangLeft -= 1;
+      this.addWanted(1, 'gang fight');
     }
   }
-}
-
-/** The player's car running over a pedestrian. */
-function carVsPeds(game, hooks) {
-  const car = game.player.inCar;
-  if (!car || car.wrecked) return;
-  const cos = Math.cos(car.angle);
-  const sin = Math.sin(car.angle);
-  for (const ped of game.peds) {
-    if (ped.dead) continue;
-    const lx = (ped.x - car.x) * cos + (ped.y - car.y) * sin;
-    const ly = -(ped.x - car.x) * sin + (ped.y - car.y) * cos;
-    if (Math.abs(lx) < CAR.length / 2 + 10 && Math.abs(ly) < CAR.width / 2 + 10) {
-      ped.dead = true;
-      ped.downTimer = 30;
-      game.scare = { x: ped.x, y: ped.y };
-      addHeat(game.police, HEAT.hitPedWithCar);
-      hooks.sound('crash');
-    }
+  tryShoot() {
+    const p = this.player;
+    if (p.inCar || p.shootCooldown > 0 || p.reloadTimer > 0) return;
+    if (p.ammo <= 0) { this.sound.blip(140, 0.06, 'square', 0.1); return; }
+    p.ammo -= 1; p.shootCooldown = 0.22;
+    this.sound.gunshot();
+    this.bullets.push(makeBullet(p.x + Math.cos(p.aimAngle) * 20, p.y + Math.sin(p.aimAngle) * 20, p.aimAngle, true));
+    this.addWanted(1, 'shooting');
+    for (const ped of this.peds) if (!ped.dead && dist(ped.x, ped.y, p.x, p.y) < 300) ped.flee = 2;
   }
-}
-
-/** Traffic hitting the player on foot, and bumping the player's car. */
-function trafficVsPlayer(game, hooks) {
-  const player = game.player;
-  for (const car of game.traffic) {
-    if (car.wrecked || car.dead || car === player.inCar) continue;
-    const dx = car.x - player.x;
-    const dy = car.y - player.y;
-    if (player.inCar) {
-      const target = player.inCar;
-      const cos = Math.cos(target.angle);
-      const sin = Math.sin(target.angle);
-      const lx = (car.x - target.x) * cos + (car.y - target.y) * sin;
-      const ly = -(car.x - target.x) * sin + (car.y - target.y) * cos;
-      if (Math.abs(lx) < CAR.length / 2 + CAR.length / 2 && Math.abs(ly) < CAR.width) {
-        const impact = Math.abs(car.speed - target.speed);
-        car.speed *= 0.4;
-        target.speed *= 0.5;
-        if (impact > 200) {
-          target.health -= 6;
-          hooks.sound('crash');
+  updateBullets(dt) {
+    this.bullets = updateBullets(this.bullets, dt);
+    for (const b of this.bullets) {
+      for (const g of this.gang) {
+        if (!g.dead && dist(b.x, b.y, g.x, g.y) < 14) { this.damageGang(g, CFG.pistolDamage); b.life = 0; }
+      }
+      for (const ped of this.peds) {
+        if (!ped.dead && dist(b.x, b.y, ped.x, ped.y) < 12) {
+          ped.dead = true; b.life = 0; this.addWanted(2, 'hit pedestrian');
         }
       }
-    } else if (!player.dead && player.hurtTimer <= 0) {
-      if (dx * dx + dy * dy < 30 * 30) {
-        if (hurtPlayer(player, 15)) game.events.push('wasted');
-        player.x -= (dx / (Math.hypot(dx, dy) || 1)) * 30;
-        player.y -= (dy / (Math.hypot(dx, dy) || 1)) * 30;
-        hooks.sound('crash');
+      for (const c of this.cars) {
+        if (!c.dead && Math.abs(b.x - c.x) < 26 && Math.abs(b.y - c.y) < 14) {
+          c.health -= 12; b.life = 0;
+          if (c.health <= 0) { c.dead = true; this.cars = this.cars.filter((x) => x !== c); }
+        }
+      }
+    }
+    this.bullets = this.bullets.filter((b) => b.life > 0);
+  }
+  updateGang(dt) {
+    const p = this.player;
+    for (const g of this.gang) {
+      if (g.dead) continue;
+      g.walkPhase += dt * 6;
+      const d = dist(g.x, g.y, p.x, p.y);
+      g.angle = angleTo(g.x, g.y, p.x, p.y);
+      if (d > 130) { g.x += Math.cos(g.angle) * g.speed * dt; g.y += Math.sin(g.angle) * g.speed * dt; }
+      g.shootTimer -= dt;
+      if (g.shootTimer <= 0 && d < 420 && !p.inCar) {
+        g.shootTimer = range(this.rng, 1.2, 2.4);
+        this.bullets.push(makeBullet(g.x, g.y, g.angle + range(this.rng, -0.12, 0.12), false));
+        this.sound.gunshot();
+      }
+    }
+    // Enemy bullets hitting the player.
+    for (const b of this.bullets) {
+      if (!b.fromPlayer && dist(b.x, b.y, p.x, p.y) < 14 && !p.inCar) {
+        b.life = 0; p.health -= 9;
+        if (p.health <= 0) this.onWasted();
       }
     }
   }
-}
-
-/**
- * One fixed step. `ctrl` is the control state for this step:
- * { moveX, moveY, throttle, steer, brake, sprint, aimAngle, shoot, punch,
- *   interact, reload }. `hooks` is { sound(name), announce(msg) } or null
- * (shot mode runs silent). Returns nothing; game.events collects outcomes.
- */
-export function stepGame(game, ctrl, dt, hooks) {
-  const sound = hooks ? hooks.sound : () => {};
-  const player = game.player;
-  game.time += dt;
-  game.events.length = 0;
-  if (game.missions.banner) {
-    game.missions.banner.timer -= dt;
-    if (game.missions.banner.timer <= 0) game.missions.banner = null;
+  step(dt) {
+    this.time += dt;
+    const input = this.input, p = this.player;
+    // Global keys.
+    if (input.pressed('KeyP') && (this.screen === 'play' || this.screen === 'paused')) {
+      this.screen = this.screen === 'play' ? 'paused' : 'play';
+    }
+    if (input.pressed('KeyM')) this.sound.muted = !this.sound.muted;
+    if (this.screen === 'title') {
+      if (input.pressed('Enter')) this.newGame();
+      if (input.pressed('KeyC') && this.hasSave) this.continueGame();
+      return;
+    }
+    if (this.screen === 'wasted' || this.screen === 'busted') {
+      if (input.pressed('Enter')) this.screen = 'play';
+      return;
+    }
+    if (this.screen === 'complete') {
+      if (input.pressed('Enter')) this.screen = 'play';
+      return;
+    }
+    if (this.screen === 'paused') return;
+    // Car enter / exit.
+    if (input.pressed('KeyE') && !p.inCar) {
+      const car = nearestCar(this, 70);
+      if (car) {
+        enterCar(this, car);
+        if (car.police === false && this.cars.includes(car)) {
+          // Stealing a traffic car: driver flees, +1 star, car leaves traffic.
+          this.addWanted(1, 'car theft');
+          this.cars = this.cars.filter((c) => c !== car);
+          this.cars.push(car);
+          const repl = makeCar('repl' + Date.now() % 100000, car.x + 400, car.y, car.angle, pick(this.rng, ['#e8452c', '#2c7de8', '#e8c832']));
+          this.cars.push(repl);
+        }
+      }
+    } else if (input.pressed('KeyF') && p.inCar) {
+      exitCar(this);
+      this._justExited = true;
+    }
+    if (input.pressed('KeyF') && !p.inCar && !this._justExited) this.tryPunch();
+    this._justExited = false;
+    if (input.pressed('KeyR') && !p.inCar && p.reloadTimer <= 0 && p.ammo < CFG.pistolMag && p.reserve > 0) p.reloadTimer = 0.9;
+    if (input.mouseDown || input.clicked) this.tryShoot();
+    // Movement.
+    if (p.inCar) updateDriving(this, dt, input);
+    else updateOnFoot(this, dt, input);
+    // Traffic + pedestrians.
+    for (const c of [...this.cars]) if (!c.police && !c.dead && c !== p.inCar) updateTrafficCar(this.world, c, dt, this.cars, p.inCar);
+    const danger = this.bullets.length ? { x: p.x, y: p.y } : null;
+    for (const ped of this.peds) updatePed(this.world, ped, dt, danger);
+    // Player car hitting pedestrians.
+    if (p.inCar) {
+      for (const ped of this.peds) {
+        if (!ped.dead && dist(p.x, p.y, ped.x, ped.y) < 30 && Math.abs(p.inCar.speed) > 40) {
+          ped.dead = true; this.addWanted(2, 'hit pedestrian'); this.sound.crash();
+        }
+      }
+      // Bumping traffic cars damages both.
+      for (const c of this.cars) {
+        if (c !== p.inCar && !c.dead && dist(p.x, p.y, c.x, c.y) < 48) {
+          c.health -= 20 * dt * 10; p.inCar.health -= 8 * dt * 10;
+          if (c.health <= 0) { c.dead = true; }
+          if (p.inCar.health <= 0) this.onCarWrecked();
+        }
+      }
+    }
+    this.updateBullets(dt);
+    this.updateGang(dt);
+    updateWanted(this, dt);
+    spawnPolice(this, this.rng);
+    updatePolice(this, dt);
+    updateMissions(this, dt);
+    // Siren wail while wanted.
+    if (this.wanted > 0) {
+      this.sirenTimer -= dt;
+      if (this.sirenTimer <= 0) { this.sirenTimer = 0.55; this.sound.sirenTick(true); }
+    }
+    // Floaters + autosave.
+    for (const f of this.floaters) { f.life -= dt; f.y -= 22 * dt; }
+    this.floaters = this.floaters.filter((f) => f.life > 0);
+    this.autosaveTimer += dt;
+    if (this.autosaveTimer >= CFG.autosaveSecs) { this.autosaveTimer = 0; this.saveNow(); }
+    // Camera follows the player, clamped to the world.
+    this.camX = clamp(p.x - CFG.viewW / 2, 0, this.world.worldW - CFG.viewW);
+    this.camY = clamp(p.y - CFG.viewH / 2, 0, this.world.worldH - CFG.viewH);
+    this.input.setCamera(this.camX, this.camY);
   }
-
-  // --- Player ---
-  if (!player.dead) {
-    if (player.inCar) {
-      const result = updateDriving(player, dt, game.city, ctrl.throttle, ctrl.steer, ctrl.brake);
-      if (result.crashed) sound('crash');
-      if (player.inCar.health <= 0 && !player.inCar.wrecked) {
-        player.inCar.wrecked = true;
-        player.inCar.health = 0;
-      }
-      if (player.inCar.wrecked) {
-        exitCar(player);
-        hurtPlayer(player, 10);
-      }
+  loop(now) {
+    const dt = Math.min(0.05, (now - this.last) / 1000 || 0.016);
+    this.last = now;
+    this.step(dt);
+    const ctx = this.ctx;
+    ctx.fillStyle = '#0a0a14'; ctx.fillRect(0, 0, CFG.viewW, CFG.viewH);
+    if (this.screen === 'title') {
+      // Title draws over a slow pan of the city.
+      this.camX = (Math.sin(this.time * 0.05) * 0.5 + 0.5) * (this.world.worldW - CFG.viewW);
+      this.camY = 200;
+      ctx.save(); ctx.translate(-this.camX, -this.camY);
+      drawWorld(ctx, this, this.camX); drawEntities(ctx, this);
+      ctx.restore();
+      drawScreen(ctx, this);
     } else {
-      updateOnFoot(player, dt, game.city, { x: ctrl.moveX, y: ctrl.moveY }, ctrl.sprint, ctrl.aimAngle);
-      if (ctrl.shoot && playerShoot(player, game.bullets)) {
-        addHeat(game.police, HEAT.shootGun);
-        game.scare = { x: player.x, y: player.y };
-        sound('gunshot');
-      }
-      if (ctrl.punch) {
-        const hits = playerPunch(player, [...game.peds, ...game.thugs]);
-        if (hits.length > 0) {
-          sound('punch');
-          for (const hit of hits) {
-            if (hit.kind === 'ped' && !hit.target.dead) {
-              hit.target.dead = true;
-              hit.target.downTimer = 30;
-              addHeat(game.police, HEAT.punchPed);
-              game.scare = { x: hit.target.x, y: hit.target.y };
-            } else if (hit.kind === 'thug') {
-              hit.target.health -= hit.damage;
-              if (hit.target.health <= 0) hit.target.dead = true;
-            }
-          }
-        }
-      }
-      if (ctrl.reload) playerReload(player);
+      ctx.save(); ctx.translate(-this.camX, -this.camY);
+      drawWorld(ctx, this, this.camX); drawEntities(ctx, this);
+      ctx.restore();
+      drawHUD(ctx, this);
+      drawMinimap(ctx, this);
+      if (this.screen !== 'play') drawScreen(ctx, this);
     }
-
-    // Enter / exit a car, or use a mission interact prompt.
-    if (ctrl.interact) {
-      if (player.inCar) {
-        exitCar(player);
-        sound('click');
-      } else if (game.missions.interactReady) {
-        // Mission interact: handled below by updateMissions.
-      } else {
-        const car = nearestEnterableCar(player, carTargets(game));
-        if (car) {
-          const result = enterCar(player, car);
-          if (result) {
-            // A stolen car leaves the traffic flow: it is the player's now,
-            // and traffic must not keep driving it or colliding with itself.
-            const index = game.traffic.indexOf(car);
-            if (index >= 0) game.traffic.splice(index, 1);
-          }
-          if (result === 'stole') {
-            addHeat(game.police, HEAT.stealCar);
-            game.scare = { x: player.x, y: player.y };
-            sound('pickup');
-          } else if (result) {
-            sound('click');
-          }
-        }
-      }
-    }
-    game.nearCar = !player.inCar ? nearestEnterableCar(player, carTargets(game)) : null;
+    this.input.endFrame();
+    requestAnimationFrame((t) => this.loop(t));
   }
-
-  // --- Missions ---
-  maybeSpawnThugs(game.missions, game);
-  const missionBefore = game.missions.index * 100 + game.missions.stage;
-  updateMissions(game.missions, game, ctrl.interact && !player.inCar && game.missions.interactReady);
-  if (game.missions.index * 100 + game.missions.stage !== missionBefore) {
-    const mission = currentMission(game.missions);
-    if (mission) sound('pickup');
-    else sound('missionComplete');
-    // Grabbing the bank cash (mission 5, stage 2) brings the heat at once.
-    if (missionBefore === 401) addHeat(game.police, 2);
-    writeSave(game);
-  }
-
-  // --- City life ---
-  updateTraffic(game.traffic, dt);
-  // Keep the streets full: a stolen car is replaced by a fresh one.
-  while (game.traffic.length < TRAFFIC.count) game.traffic.push(spawnTrafficCar(game.random));
-  updatePedestrians(game.peds, dt, game.city, game.scare, game.random);
-  game.scare = null;
-  updateThugs(game.thugs, dt, player, game.bullets, game.random);
-  const targets = [...game.peds.filter((p) => !p.dead), ...game.thugs, ...carTargets(game)];
-  if (!player.dead) targets.push(player);
-  const hits = updateBullets(game.bullets, dt, game.city, targets);
-  for (const hit of hits) applyHit(game, hit, hooks ?? { sound: () => {} });
-  game.bullets = game.bullets.filter((b) => !b.dead);
-  carVsPeds(game, hooks ?? { sound: () => {} });
-  trafficVsPlayer(game, hooks ?? { sound: () => {} });
-
-  // --- Police ---
-  const policeEvents = updatePolice(game.police, dt, player, game.city, game.random);
-  if (policeEvents.busted) game.events.push('busted');
-  if (policeEvents.rammedPlayer) sound('crash');
-  if (wantedStars(game.police) > 0 && Math.floor(game.time * 2) !== Math.floor((game.time - dt) * 2)) {
-    sound('siren');
-  }
-
-  // --- Safehouse healing ---
-  const safe = game.city.landmarks.safehouse;
-  if (!player.inCar && Math.hypot(player.x - safe.x, player.y - safe.y) < 70) {
-    healPlayer(player, 20 * dt);
-  }
-
-  // --- Autosave ---
-  game.autosaveTimer -= dt;
-  if (game.autosaveTimer <= 0) {
-    game.autosaveTimer = AUTOSAVE_SECONDS;
-    writeSave(game);
-  }
-  if (game.money > readBestCash()) writeBestCash(game.money);
 }
 
 const canvas = document.getElementById('game');
-const status = document.getElementById('status');
-const game = createGame(seed);
-// Exposed for automated smoke tests (and curious players): read-only handle to the live state.
-window.__neonGame = game;
-const renderer = createRenderer(canvas);
-const audio = createAudio();
-const saveData = readSave();
-
-function runShot(name) {
-  const scene = stageShot(name, game, stepGame);
-  let painted = 0;
-  function paint() {
-    renderer.draw(game, scene.screen, { time: game.time, saveExists: false, saveMoney: 0, saveMission: 0, fine: 0 });
-    painted += 1;
-    if (painted < 2) requestAnimationFrame(paint);
-    else window.__shotReady = true;
-  }
-  requestAnimationFrame(paint);
+export const game = new Game(canvas);
+window.__game = game;
+// Deterministic screenshot staging (?shot=...). See shots.js.
+const params = new URLSearchParams(location.search);
+if (params.get('shot')) {
+  stageShot(params.get('shot'), game);
+  window.__shotReady = true;
 }
-
-function runGame() {
-  const input = createInput(canvas);
-  let screen = SCREEN_TITLE;
-  let best = readBestCash();
-  let accumulator = 0;
-  let last = performance.now();
-  let continueKey = false;
-
-  window.addEventListener('keydown', (event) => {
-    if (event.code === 'KeyC' && !event.repeat) continueKey = true;
-    if (event.code === 'KeyM' && !event.repeat) audio.setMuted(!audio.isMuted());
-  });
-
-  function announce(message) {
-    status.textContent = message;
-  }
-
-  const hooks = {
-    sound: (name) => {
-      if (name === 'gunshot') audio.gunshot();
-      else if (name === 'punch') audio.punch();
-      else if (name === 'crash') audio.crash();
-      else if (name === 'siren') audio.siren();
-      else if (name === 'pickup') audio.pickup();
-      else if (name === 'missionComplete') audio.missionComplete();
-      else if (name === 'busted') audio.busted();
-      else if (name === 'click') audio.click();
-      else if (name === 'hurt') audio.hurt();
-    },
-    announce,
-  };
-
-  function startFresh() {
-    const fresh = createGame(Math.floor(Math.random() * 4294967296));
-    Object.assign(game, fresh);
-    clearSave();
-    screen = SCREEN_PLAY;
-    announce('Neon Palms. Mission 1: walk to The Flamingo bar.');
-  }
-
-  function startContinue() {
-    const fresh = createGame(Math.floor(Math.random() * 4294967296));
-    Object.assign(game, fresh);
-    applySave(game, saveData);
-    screen = SCREEN_PLAY;
-    announce(`Continuing. Mission ${game.missions.index + 1}.`);
-  }
-
-  function buildCtrl(actions) {
-    const move = input.move();
-    const drive = input.drive();
-    const mouse = input.mouse();
-    const aim = renderer.aimPoint
-      ? renderer.aimPoint(game, mouse.x, mouse.y)
-      : { x: game.player.x + 1, y: game.player.y };
-    return {
-      moveX: move.x,
-      moveY: move.y,
-      throttle: drive.throttle,
-      steer: drive.steer,
-      brake: drive.brake,
-      sprint: input.sprint(),
-      aimAngle: Math.atan2(aim.y - game.player.y, aim.x - game.player.x),
-      shoot: input.takeClick() || input.mouseDown(),
-      punch: Boolean(actions & ACTION_PUNCH),
-      interact: Boolean(actions & ACTION_INTERACT),
-      reload: Boolean(actions & ACTION_RELOAD),
-      pause: Boolean(actions & ACTION_PAUSE),
-    };
-  }
-
-  function frame(now) {
-    requestAnimationFrame(frame);
-    accumulator += Math.min((now - last) / 1000, MAX_FRAME);
-    last = now;
-    // Actions are read once per frame, not per step.
-    const actions = input.takeActions();
-    const ctrl = buildCtrl(actions);
-    handleActionsWith(actions);
-    if (screen === SCREEN_PLAY) {
-      while (accumulator >= STEP) {
-        stepGame(game, ctrl, STEP, hooks);
-        accumulator -= STEP;
-        if (game.events.includes('wasted')) {
-          screen = SCREEN_OVER;
-          writeSave(game);
-          announce(`Wasted. You had $${game.money}.`);
-          break;
-        }
-        if (game.events.includes('busted')) {
-          const fine = Math.min(game.money, MONEY.bustFine);
-          game.money -= fine;
-          applyBust(game.police, game.player, game.city);
-          audio.busted();
-          writeSave(game);
-          screen = SCREEN_BUSTED;
-          ui.fine = fine;
-          announce(`Busted. Fined $${fine}.`);
-          break;
-        }
-        if (game.missions.done && !game.winShown) {
-          game.winShown = true;
-          screen = SCREEN_WIN;
-          announce('Story complete.');
-          break;
-        }
-      }
-    } else if (screen === SCREEN_TITLE) {
-      // Attract mode: the city lives behind the title.
-      while (accumulator >= STEP) {
-        updateTraffic(game.traffic, STEP);
-        updatePedestrians(game.peds, STEP, game.city, null, game.random);
-        game.time += STEP;
-        accumulator -= STEP;
-      }
-    } else {
-      accumulator = 0;
-    }
-    audio.setEngine(game.player.inCar ? game.player.speed : 0, Boolean(game.player.inCar) && screen === SCREEN_PLAY);
-    renderer.draw(game, screen, ui);
-  }
-
-  const ui = {
-    get time() { return game.time; },
-    saveExists: Boolean(saveData),
-    saveMoney: saveData ? saveData.money : 0,
-    saveMission: saveData ? saveData.missionIndex : 0,
-    fine: 0,
-  };
-
-  // handleActions needs the actions taken this frame; wrap it so frame() can
-  // pass them in without double-taking.
-  function handleActionsWith(actions) {
-    if (screen === SCREEN_TITLE) {
-      if (continueKey && saveData) {
-        continueKey = false;
-        audio.unlock();
-        startContinue();
-      } else if (actions & ACTION_CONFIRM) {
-        audio.unlock();
-        if (saveData) startContinue();
-        else startFresh();
-      }
-      return;
-    }
-    if (screen === SCREEN_OVER || screen === SCREEN_BUSTED) {
-      if (actions & ACTION_CONFIRM) {
-        audio.unlock();
-        if (saveData) startContinue();
-        else startFresh();
-      }
-      return;
-    }
-    if (screen === SCREEN_WIN) {
-      if (actions & ACTION_CONFIRM) screen = SCREEN_PLAY;
-      return;
-    }
-    if (actions & ACTION_PAUSE) {
-      if (screen === SCREEN_PLAY) {
-        screen = SCREEN_PAUSED;
-        announce('Paused.');
-      } else if (screen === SCREEN_PAUSED) {
-        screen = SCREEN_PLAY;
-        announce('Playing.');
-      }
-    }
-  }
-
-  document.addEventListener('visibilitychange', () => {
-    if (document.hidden && screen === SCREEN_PLAY) {
-      screen = SCREEN_PAUSED;
-      announce('Paused.');
-    }
-  });
-
-  announce('Neon Palms. Press Enter or click to start.');
-  requestAnimationFrame(frame);
-}
-
-if (shot) runShot(shot);
-else runGame();

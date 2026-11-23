@@ -1,76 +1,29 @@
-// Save and load: one localStorage slot holding cash, health, mission progress,
-// position and wanted level, plus the best cash ever held. Everything is plain
-// JSON; a corrupt or missing slot just starts a new game.
-import { BEST_KEY, SAVE_KEY } from './config.js';
+// Neon Palms — localStorage autosave + best-cash record.
+const KEY = 'neon-palms-save-v1';
+const BEST_KEY = 'neon-palms-best-cash';
 
-export function readSave() {
+export function saveGame(game) {
   try {
-    const raw = window.localStorage.getItem(SAVE_KEY);
-    if (!raw) return null;
-    const data = JSON.parse(raw);
-    if (!data || typeof data !== 'object') return null;
-    return data;
-  } catch {
-    return null;
-  }
-}
-
-export function writeSave(game) {
-  try {
+    const p = game.player;
     const data = {
-      version: 1,
-      money: game.money,
-      health: game.player.health,
-      missionIndex: game.missions.index,
-      missionStage: game.missions.stage,
-      missionsDone: game.missions.completedCount,
-      x: game.player.x,
-      y: game.player.y,
-      stars: game.police.stars,
-      savedAt: Date.now(),
+      money: p.money, health: p.health, missionIndex: game.missions.index,
+      wanted: game.wanted, x: p.x, y: p.y, bestCash: game.bestCash || 0, savedAt: Date.now(),
     };
-    window.localStorage.setItem(SAVE_KEY, JSON.stringify(data));
-    return true;
-  } catch {
-    return false;
-  }
+    localStorage.setItem(KEY, JSON.stringify(data));
+    localStorage.setItem(BEST_KEY, String(Math.max(game.bestCash || 0, p.money)));
+  } catch (e) { /* storage unavailable (private mode) — game still plays */ }
 }
-
-export function applySave(game, data) {
-  if (!data) return false;
-  game.money = typeof data.money === 'number' ? data.money : game.money;
-  game.player.health = typeof data.health === 'number' ? data.health : game.player.health;
-  game.missions.index = typeof data.missionIndex === 'number' ? data.missionIndex : 0;
-  game.missions.stage = typeof data.missionStage === 'number' ? data.missionStage : 0;
-  game.missions.completedCount = typeof data.missionsDone === 'number' ? data.missionsDone : 0;
-  if (typeof data.x === 'number' && typeof data.y === 'number') {
-    game.player.x = data.x;
-    game.player.y = data.y;
-  }
-  game.police.stars = typeof data.stars === 'number' ? data.stars : 0;
-  return true;
-}
-
-export function readBestCash() {
+export function loadGame() {
   try {
-    return Number.parseInt(window.localStorage.getItem(BEST_KEY) ?? '0', 10) || 0;
-  } catch {
-    return 0;
-  }
+    const raw = localStorage.getItem(KEY);
+    if (!raw) return null;
+    return JSON.parse(raw);
+  } catch (e) { return null; }
 }
-
-export function writeBestCash(value) {
-  try {
-    window.localStorage.setItem(BEST_KEY, String(value));
-  } catch {
-    // Storage can be off: best cash then lasts this visit only.
-  }
+export function hasSave() { return loadGame() !== null; }
+export function bestCash() {
+  try { return Number(localStorage.getItem(BEST_KEY) || 0); } catch (e) { return 0; }
 }
-
 export function clearSave() {
-  try {
-    window.localStorage.removeItem(SAVE_KEY);
-  } catch {
-    // Nothing to clear.
-  }
+  try { localStorage.removeItem(KEY); } catch (e) {}
 }
